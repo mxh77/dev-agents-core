@@ -64,7 +64,7 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GITHUB_EVENT_PATH: ${{ github.event_path }}
         run: |
-          python3 dev-agents-core/tools/agent_v1.py
+          python3 dev-agents-core/tools/product_spec_agent.py
 
       - name: Debug context
         run: |
