@@ -1,0 +1,139 @@
+name: Agent V1 Reusable
+
+on:
+  workflow_call:
+    inputs:
+      project_name:
+        required: true
+        type: string
+      base_branch:
+        required: false
+        type: string
+        default: main
+      trigger_label:
+        required: false
+        type: string
+        default: agent-v1
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+jobs:
+  agent-v1:
+    if: github.event_name == 'workflow_dispatch' || contains(join(github.event.issue.labels.*.name, ','), inputs.trigger_label)
+    runs-on: [self-hosted]
+
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout dev-agents-core
+        uses: actions/checkout@v4
+        with:
+          repository: mxh77/dev-agents-core
+          path: dev-agents-core
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check environment
+        run: |
+          echo "Node: $(node -v || echo missing)"
+          echo "Python: $(python3 --version || echo missing)"
+          echo "jq: $(jq --version || echo missing)"
+          echo "Git: $(git --version || echo missing)"
+
+      - name: Configure git
+        run: |
+          git config user.name "agent-v1"
+          git config user.email "agent-v1@local"
+
+      - name: Run agent
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+        run: |
+          python3 dev-agents-core/tools/agent_v1.py
+
+      - name: Debug context
+        run: |
+          echo "Branch file:"
+          cat .ai/branch_name.txt || echo "missing"
+          echo "PR body:"
+          cat .ai/pr_body.md || echo "missing"
+
+      - name: Create branch
+        run: |
+          BRANCH_NAME="$(cat .ai/branch_name.txt)"
+          git checkout -B "$BRANCH_NAME"
+
+      - name: Commit files
+        run: |
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          if [ -z "$ISSUE_NUMBER" ]; then
+            ISSUE_NUMBER="manual"
+          fi
+          git add .ai/issues .ai/pr_body.md .ai/branch_name.txt
+          git commit -m "agent-v1: cadrage issue #$ISSUE_NUMBER" || echo "Rien à commit"
+
+      - name: Push branch
+        run: |
+          BRANCH_NAME="$(cat .ai/branch_name.txt)"
+          git push origin "$BRANCH_NAME" --force-with-lease
+
+      - name: Check existing PR
+        id: check_pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH_NAME="$(cat .ai/branch_name.txt)"
+          EXISTING_PR=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls?state=open&head=${{ github.repository_owner }}:${BRANCH_NAME}" \
+            | jq '.[0].number // empty')
+          echo "existing_pr=$EXISTING_PR" >> $GITHUB_OUTPUT
+
+      - name: Open PR
+        if: steps.check_pr.outputs.existing_pr == ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH_NAME="$(cat .ai/branch_name.txt)"
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          if [ -z "$ISSUE_NUMBER" ]; then
+            ISSUE_NUMBER="manual"
+          fi
+          PR_TITLE="agent-v1: cadrage issue #$ISSUE_NUMBER"
+          PR_BODY="$(cat .ai/pr_body.md)"
+          jq -n \
+            --arg title "$PR_TITLE" \
+            --arg head "$BRANCH_NAME" \
+            --arg base "${{ inputs.base_branch }}" \
+            --arg body "$PR_BODY" \
+            '{title:$title, head:$head, base:$base, body:$body}' > pr.json
+
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls" \
+            -d @pr.json | tee pr_response.json
+
+      - name: Show PR status
+        run: |
+          if [ -f pr_response.json ]; then
+            echo "PR créée :"
+            cat pr_response.json | jq '{number, html_url, title}'
+          else
+            echo "PR déjà existante : #${{ steps.check_pr.outputs.existing_pr }}"
+          fi
