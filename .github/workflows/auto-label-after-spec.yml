@@ -21,6 +21,9 @@ on:
       merged:
         required: true
         type: boolean
+    secrets:
+      PAT_TOKEN:
+        required: true
 
 permissions:
   issues: write
@@ -44,6 +47,7 @@ jobs:
         if: steps.extract.outputs.issue_number != ''
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.PAT_TOKEN }}
           script: |
             await github.rest.issues.addLabels({
               owner: context.repo.owner,
