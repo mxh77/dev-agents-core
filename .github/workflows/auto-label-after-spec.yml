@@ -1,0 +1,53 @@
+name: Auto Label After Spec Merge (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      base_branch:
+        required: false
+        type: string
+        default: main
+      spec_branch_prefix:
+        required: false
+        type: string
+        default: product-spec-agent/issue-
+      next_label:
+        required: false
+        type: string
+        default: feature-dev-agent
+      head_ref:
+        required: true
+        type: string
+      merged:
+        required: true
+        type: boolean
+
+permissions:
+  issues: write
+
+jobs:
+  auto-label:
+    if: >
+      inputs.merged == true &&
+      startsWith(inputs.head_ref, inputs.spec_branch_prefix)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract issue number
+        id: extract
+        run: |
+          BRANCH="${{ inputs.head_ref }}"
+          PREFIX="${{ inputs.spec_branch_prefix }}"
+          ISSUE_NUMBER=$(echo "$BRANCH" | sed "s|^${PREFIX}||" | grep -oP '^\d+')
+          echo "issue_number=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
+
+      - name: Apply next label
+        if: steps.extract.outputs.issue_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: parseInt('${{ steps.extract.outputs.issue_number }}'),
+              labels: ['${{ inputs.next_label }}']
+            });
