@@ -15,6 +15,10 @@ on:
         required: false
         type: string
         default: feature-dev-agent
+      prev_label:
+        required: false
+        type: string
+        default: product-spec-agent
       head_ref:
         required: true
         type: string
@@ -43,15 +47,18 @@ jobs:
           ISSUE_NUMBER=$(echo "$BRANCH" | sed "s|^${PREFIX}||" | grep -oP '^\d+')
           echo "issue_number=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
 
-      - name: Apply next label
+      - name: Apply next label and remove prev label
         if: steps.extract.outputs.issue_number != ''
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
           script: |
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: parseInt('${{ steps.extract.outputs.issue_number }}'),
-              labels: ['${{ inputs.next_label }}']
-            });
+            const issue_number = parseInt('${{ steps.extract.outputs.issue_number }}');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            await github.rest.issues.addLabels({ owner, repo, issue_number, labels: ['${{ inputs.next_label }}'] });
+            try {
+              await github.rest.issues.removeLabel({ owner, repo, issue_number, name: '${{ inputs.prev_label }}' });
+            } catch (e) {
+              if (e.status !== 404) throw e;
+            }
