@@ -83,7 +83,7 @@ issue_dir.mkdir(parents=True, exist_ok=True)
 spec_path = issue_dir / "spec.md"
 spec_path.write_text(text.strip() + "\n", encoding="utf-8")
 
-pr_body = f"""## Agent V1
+pr_body = f"""## Product Spec Agent
 
 Issue source: #{issue_number}
 

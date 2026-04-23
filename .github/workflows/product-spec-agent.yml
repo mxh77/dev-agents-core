@@ -1,4 +1,4 @@
-name: Agent V1 Reusable
+name: Product Spec Agent Reusable
 
 on:
   workflow_call:
