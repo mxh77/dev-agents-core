@@ -14,9 +14,15 @@ on:
         required: false
         type: string
         default: feature-dev-agent
+      ai_model:
+        required: false
+        type: string
+        default: gpt-4.1
     secrets:
       OPENAI_API_KEY:
-        required: true
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
 
 permissions:
   contents: write
@@ -62,6 +68,8 @@ jobs:
       - name: Run agent
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_MODEL: ${{ inputs.ai_model }}
           GITHUB_EVENT_PATH: ${{ github.event_path }}
         run: |
           python3 dev-agents-core/tools/feature_dev_agent.py

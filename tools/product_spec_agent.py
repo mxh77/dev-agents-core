@@ -6,8 +6,8 @@ import re
 import sys
 import urllib.request
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 GITHUB_EVENT_PATH = os.environ["GITHUB_EVENT_PATH"]
+AI_MODEL = os.environ.get("AI_MODEL", "gpt-4.1")
 
 ROOT = pathlib.Path.cwd()
 OUT_DIR = ROOT / ".ai" / "issues"
@@ -50,28 +50,66 @@ Sois concret, orienté exécution, sans blabla.
 """
 
 payload = {
-    "model": "gpt-4.1",
+    "model": AI_MODEL,
     "input": prompt
 }
 
-req = urllib.request.Request(
-    "https://api.openai.com/v1/responses",
-    data=json.dumps(payload).encode("utf-8"),
-    headers={
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-    },
-    method="POST",
-)
+def call_api(prompt: str, model: str) -> str:
+    if model.startswith("claude-"):
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            print("ANTHROPIC_API_KEY manquant pour le modèle Claude.", file=sys.stderr)
+            sys.exit(1)
+        payload = {
+            "model": model,
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return "".join(
+            block.get("text", "")
+            for block in data.get("content", [])
+            if block.get("type") == "text"
+        )
+    else:
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            print("OPENAI_API_KEY manquant pour le modèle OpenAI.", file=sys.stderr)
+            sys.exit(1)
+        payload = {
+            "model": model,
+            "input": prompt,
+        }
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/responses",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return "".join(
+            content.get("text", "")
+            for item in data.get("output", [])
+            for content in item.get("content", [])
+            if content.get("type") == "output_text"
+        )
 
-with urllib.request.urlopen(req) as resp:
-    data = json.loads(resp.read().decode("utf-8"))
-
-text = ""
-for item in data.get("output", []):
-    for content in item.get("content", []):
-        if content.get("type") == "output_text":
-            text += content.get("text", "")
+text = call_api(prompt, AI_MODEL)
 
 if not text.strip():
     print("Aucune sortie texte renvoyée par l'API OpenAI.", file=sys.stderr)
