@@ -27,7 +27,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  agent-v1:
+  product-spec-agent:
     if: github.event_name == 'workflow_dispatch' || github.event.label.name == inputs.trigger_label
     runs-on: [self-hosted]
 
@@ -56,8 +56,8 @@ jobs:
 
       - name: Configure git
         run: |
-          git config user.name "agent-v1"
-          git config user.email "agent-v1@local"
+          git config user.name "product-spec-agent"
+          git config user.email "product-spec-agent@local"
 
       - name: Run agent
         env:
@@ -85,7 +85,7 @@ jobs:
             ISSUE_NUMBER="manual"
           fi
           git add .ai/issues .ai/pr_body.md .ai/branch_name.txt
-          git commit -m "agent-v1: cadrage issue #$ISSUE_NUMBER" || echo "Rien à commit"
+          git commit -m "product-spec-agent: cadrage issue #$ISSUE_NUMBER" || echo "Rien à commit"
 
       - name: Push branch
         run: |
@@ -116,7 +116,7 @@ jobs:
           if [ -z "$ISSUE_NUMBER" ]; then
             ISSUE_NUMBER="manual"
           fi
-          PR_TITLE="agent-v1: cadrage issue #$ISSUE_NUMBER"
+          PR_TITLE="product-spec-agent: cadrage issue #$ISSUE_NUMBER"
           PR_BODY="$(cat .ai/pr_body.md)"
           jq -n \
             --arg title "$PR_TITLE" \
