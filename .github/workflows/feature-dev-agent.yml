@@ -28,7 +28,7 @@ env:
 
 jobs:
   feature-dev-agent:
-    if: github.event_name == 'workflow_dispatch' || contains(join(github.event.issue.labels.*.name, ','), inputs.trigger_label)
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == inputs.trigger_label
     runs-on: [self-hosted]
 
     steps:

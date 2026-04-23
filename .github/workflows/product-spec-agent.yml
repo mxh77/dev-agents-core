@@ -13,7 +13,7 @@ on:
       trigger_label:
         required: false
         type: string
-        default: agent-v1
+        default: product-spec-agent
     secrets:
       OPENAI_API_KEY:
         required: true
@@ -28,7 +28,7 @@ env:
 
 jobs:
   agent-v1:
-    if: github.event_name == 'workflow_dispatch' || contains(join(github.event.issue.labels.*.name, ','), inputs.trigger_label)
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == inputs.trigger_label
     runs-on: [self-hosted]
 
     steps:
