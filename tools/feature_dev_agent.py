@@ -79,12 +79,25 @@ if not spec_path.exists():
 spec_content = spec_path.read_text(encoding="utf-8")
 repo_tree = get_repo_tree(ROOT)
 
+# Charger les conventions du projet si disponibles
+conventions_path = ROOT / ".github" / "copilot-instructions.md"
+if conventions_path.exists():
+    conventions_content = conventions_path.read_text(encoding="utf-8")
+    conventions_section = f"""== CONVENTIONS OBLIGATOIRES DU PROJET ==
+(Source : .github/copilot-instructions.md — à respecter STRICTEMENT)
+
+{conventions_content}
+
+"""
+else:
+    conventions_section = ""
+
 prompt = f"""Tu es un agent de développement senior. Tu reçois une spec technique et la structure du repo.
 Tu dois implémenter la feature décrite, en générant les fichiers nécessaires.
 
 Issue #{issue_number} — {title}
 
-== SPEC ==
+{conventions_section}== SPEC ==
 {spec_content}
 
 == STRUCTURE DU REPO ==
@@ -98,7 +111,7 @@ Règles strictes :
 - Génère uniquement les fichiers nécessaires à l'implémentation (nouveaux ou modifiés)
 - Les chemins sont relatifs à la racine du repo
 - Le contenu de chaque fichier est complet (pas de placeholders, pas de "...")
-- Respecte la structure et les conventions du repo existant
+- Respecte IMPÉRATIVEMENT les conventions listées ci-dessus
 - Pas de markdown autour du JSON, uniquement le JSON brut
 """
 
