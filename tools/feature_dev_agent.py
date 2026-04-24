@@ -115,7 +115,7 @@ def call_api(prompt: str, model: str) -> str:
             sys.exit(1)
         payload = {
             "model": model,
-            "max_tokens": 8192,
+            "max_tokens": 16000,
             "messages": [{"role": "user", "content": prompt}],
         }
         req = urllib.request.Request(
@@ -143,6 +143,7 @@ def call_api(prompt: str, model: str) -> str:
         payload = {
             "model": model,
             "input": prompt,
+            "max_output_tokens": 32000,
         }
         req = urllib.request.Request(
             "https://api.openai.com/v1/responses",
