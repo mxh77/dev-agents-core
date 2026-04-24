@@ -65,6 +65,32 @@ jobs:
           git config user.name "feature-dev-agent"
           git config user.email "feature-dev-agent@local"
 
+      - name: Fetch spec from product-spec-agent branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          if [ -z "$ISSUE_NUMBER" ]; then
+            ISSUE_NUMBER="${{ inputs.issue_number }}"
+          fi
+          echo "Recherche spec pour l'issue #$ISSUE_NUMBER"
+          git fetch origin
+          SPEC_BRANCH=$(git branch -r --list "origin/product-spec-agent/issue-${ISSUE_NUMBER}-*" | head -n1 | xargs)
+          if [ -n "$SPEC_BRANCH" ]; then
+            echo "Branche spec trouvée : $SPEC_BRANCH"
+            SPEC_FILE=$(git ls-tree -r --name-only "$SPEC_BRANCH" | grep "^\.ai/issues/${ISSUE_NUMBER}-[^/]*/spec\.md$" | head -n1)
+            if [ -n "$SPEC_FILE" ]; then
+              SPEC_DIR=$(dirname "$SPEC_FILE")
+              mkdir -p "$SPEC_DIR"
+              git show "${SPEC_BRANCH}:${SPEC_FILE}" > "$SPEC_FILE"
+              echo "Spec copiée : $SPEC_FILE"
+            else
+              echo "Aucun fichier spec.md trouvé dans $SPEC_BRANCH"
+            fi
+          else
+            echo "Aucune branche product-spec-agent trouvée pour l'issue #$ISSUE_NUMBER (la spec sera cherchée localement)"
+          fi
+
       - name: Run agent
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
