@@ -23,6 +23,8 @@ on:
         required: false
       ANTHROPIC_API_KEY:
         required: false
+      DEEPSEEK_API_KEY:
+        required: false
 
 permissions:
   contents: write
@@ -69,6 +71,7 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           AI_MODEL: ${{ inputs.ai_model }}
           GITHUB_EVENT_PATH: ${{ github.event_path }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

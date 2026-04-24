@@ -148,6 +148,27 @@ def call_api(prompt: str, model: str) -> str:
             for block in data.get("content", [])
             if block.get("type") == "text"
         )
+    elif "deepseek" in model:
+        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        if not api_key:
+            print("[feature-dev-agent] DEEPSEEK_API_KEY manquant pour le modèle DeepSeek.", file=sys.stderr)
+            sys.exit(1)
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        req = urllib.request.Request(
+            "https://api.deepseek.com/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"]
     else:
         api_key = os.environ.get("OPENAI_API_KEY", "")
         if not api_key:
