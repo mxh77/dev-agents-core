@@ -544,12 +544,13 @@ patches = []   # [(path, old_str, new_str), ...]
 new_files = [] # [(path, content), ...]
 summary = "Implémentation générée par feature-dev-agent."
 
+# Patterns tolérants : <<<OLD>> ou <<<OLD>>> (2 ou 3 '>'), idem pour NEW/END/PATCH/FILE/SUMMARY
 patch_pattern = re.compile(
-    r'<<<PATCH:([^>]+)>>>\s*<<<OLD>>>\n(.*?)<<<NEW>>>\n(.*?)<<<END>>>',
+    r'<<<PATCH:([^>]+?)>{2,3}\s*<<<OLD>{2,3}\n(.*?)<<<NEW>{2,3}\n(.*?)<<<END>{2,3}',
     re.DOTALL
 )
-file_pattern = re.compile(r'<<<FILE:([^>]+)>>>\n(.*?)<<<END>>>', re.DOTALL)
-summary_pattern = re.compile(r'<<<SUMMARY>>>\n(.*?)<<<END>>>', re.DOTALL)
+file_pattern = re.compile(r'<<<FILE:([^>]+?)>{2,3}\n(.*?)<<<END>{2,3}', re.DOTALL)
+summary_pattern = re.compile(r'<<<SUMMARY>{2,3}\n(.*?)<<<END>{2,3}', re.DOTALL)
 
 for m in patch_pattern.finditer(raw):
     path = m.group(1).strip()
