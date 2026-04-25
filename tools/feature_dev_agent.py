@@ -308,7 +308,49 @@ def call_api_agentic(system_prompt: str, user_prompt: str, model: str) -> str:
             messages.append(message)
 
             if finish_reason != "tool_calls":
-                return message.get("content") or ""
+                content = message.get("content") or ""
+                # Vérifier que le LLM a utilisé les bons délimiteurs
+                if "<<<PATCH:" in content or "<<<FILE:" in content:
+                    return content
+                # Sinon : rappel de format (1 seul retry)
+                print("[feature-dev-agent] ⚠ Réponse sans délimiteurs — rappel du format...", file=sys.stderr)
+                REMINDER = (
+                    "Ta réponse doit OBLIGATOIREMENT utiliser les délimiteurs suivants, sans aucun texte libre.\n"
+                    "Pour chaque fichier EXISTANT à modifier :\n"
+                    "<<<PATCH:chemin/relatif/fichier>>>\n"
+                    "<<<OLD>>>\n"
+                    "bloc exact à remplacer (copié mot pour mot)\n"
+                    "<<<NEW>>>\n"
+                    "nouveau bloc\n"
+                    "<<<END>>>\n"
+                    "Pour chaque NOUVEAU fichier :\n"
+                    "<<<FILE:chemin/relatif/fichier>>>\n"
+                    "contenu complet\n"
+                    "<<<END>>>\n"
+                    "<<<SUMMARY>>>\n"
+                    "résumé\n"
+                    "<<<END>>>\n"
+                    "Génère MAINTENANT les patches/fichiers en utilisant exactement ce format."
+                )
+                messages.append({"role": "user", "content": REMINDER})
+                # Appel de rappel sans tools pour forcer la sortie finale
+                payload_retry = {
+                    "model": model,
+                    "messages": messages,
+                    "max_tokens": 32000,
+                }
+                req_retry = urllib.request.Request(
+                    base_url,
+                    data=json.dumps(payload_retry).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_retry, timeout=180) as resp_retry:
+                    data_retry = json.loads(resp_retry.read().decode("utf-8"))
+                return data_retry["choices"][0]["message"].get("content") or ""
 
             # Exécuter les outils demandés
             tool_calls = message.get("tool_calls", [])
@@ -449,6 +491,31 @@ RÈGLES CRITIQUES :
 - Aucun texte hors des délimiteurs dans ta réponse finale
 """
 
+FORMAT_REMINDER = """
+== FORMAT DE SORTIE OBLIGATOIRE ==
+Quand tu as terminé de lire les fichiers, ta réponse finale DOIT utiliser UNIQUEMENT ces délimiteurs :
+
+Pour chaque fichier existant à modifier :
+<<<PATCH:chemin/relatif/fichier>>>
+<<<OLD>>>
+bloc exact à remplacer (copié mot pour mot depuis le fichier lu)
+<<<NEW>>>
+nouveau bloc
+<<<END>>>
+
+Pour chaque nouveau fichier :
+<<<FILE:chemin/relatif/fichier>>>
+contenu complet
+<<<END>>>
+
+<<<SUMMARY>>>
+Résumé Markdown
+<<<END>>>
+
+INTERDIT : écrire du texte libre, des titres Markdown, des listes hors délimiteurs.
+Ta réponse commence directement par <<<PATCH: ou <<<FILE:
+"""
+
 user_prompt = f"""Implémente la feature suivante.
 
 Issue #{issue_number} — {title}
@@ -458,8 +525,8 @@ Issue #{issue_number} — {title}
 
 == STRUCTURE DU REPO ==
 {repo_tree}
-
-Commence par lire les fichiers que tu vas modifier avec read_file(), puis génère les patches/fichiers.
+{FORMAT_REMINDER}
+Commence par lire les fichiers que tu vas modifier avec read_file(), puis génère les patches/fichiers en suivant EXACTEMENT le format ci-dessus.
 """
 
 # ─── Appel agentique (boucle outil) ──────────────────────────────────────────
