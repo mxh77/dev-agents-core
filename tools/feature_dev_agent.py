@@ -178,13 +178,36 @@ if conventions_path.exists():
 else:
     conventions_section = ""
 
-# ─── Passe 1 : identifier les fichiers existants à lire ──────────────────────
-# On demande à l'IA quels fichiers elle a besoin de lire avant de coder
+# Charger le contexte global du codebase (généré par init_context_agent.py)
+context_doc_path = AI_DIR / "codebase_context.md"
+if context_doc_path.exists():
+    codebase_context_content = context_doc_path.read_text(encoding="utf-8")
+    codebase_context_section = f"""== CONTEXTE GLOBAL DU CODEBASE ==
+(Généré par init_context_agent — architecture, modules, types, routes, hooks, schéma DB)
 
-PASS1_MAX_CHARS = 4000  # Limite du contenu de chaque fichier existant injecté
+{codebase_context_content}
 
-scan_prompt = f"""Tu es un agent de développement senior.
-Tu vas implémenter une feature dans un projet. Avant de coder, tu dois identifier quels fichiers existants tu as besoin de lire intégralement pour éviter de perdre du code existant.
+"""
+    print("[feature-dev-agent] Contexte global codebase chargé (.ai/codebase_context.md).", file=sys.stderr)
+else:
+    codebase_context_section = ""
+    print("[feature-dev-agent] ⚠ Pas de .ai/codebase_context.md — contexte global absent (lancer init-context).", file=sys.stderr)
+
+# ─── Passe 1 : identifier les fichiers à lire ────────────────────────────────
+# Si .ai/codebase_context.md existe → seulement files_to_modify (contenu complet).
+# Sinon → stratégie 2 niveaux : files_to_modify + files_for_context (squelettes).
+#
+# Budget :
+#   Fenêtre LLM ≈ 128k tokens ≈ 512k chars.
+#   Spec + conventions + contexte global + repo tree ≈ ~80k chars → il reste ~430k pour les fichiers.
+BUDGET_MODIFY_CHARS = 400000   # budget total pour les fichiers à modifier (contenu complet)
+BUDGET_CONTEXT_LINES = 100     # nb de lignes max par fichier de contexte (imports + signatures)
+
+if codebase_context_section:
+    # Contexte global disponible : on ne demande que les fichiers à modifier
+    scan_prompt = f"""Tu es un agent de développement senior.
+Tu vas implémenter une feature dans un projet. Le contexte global du codebase te sera fourni séparément.
+Identifie uniquement les fichiers existants que tu devras MODIFIER pour implémenter la feature.
 
 Issue #{issue_number} — {title}
 
@@ -194,49 +217,139 @@ Issue #{issue_number} — {title}
 == STRUCTURE DU REPO ==
 {repo_tree}
 
-Réponds UNIQUEMENT avec un objet JSON : {{"files_to_read": ["chemin/relatif/1", "chemin/relatif/2", ...]}}
-- Liste les fichiers existants que tu devras MODIFIER (pas les nouveaux fichiers à créer)
-- Chemins relatifs à la racine du repo
-- Maximum 10 fichiers
+Réponds UNIQUEMENT avec un objet JSON :
+{{
+  "files_to_modify": ["chemin/relatif/fichier_a_modifier_1", ...]
+}}
+
+- "files_to_modify" : fichiers existants que tu MODIFIERAS directement (contenu complet fourni)
+- N'inclus PAS les fichiers de contexte — ils sont déjà inclus dans le contexte global du codebase
+- Chemins relatifs à la racine du repo, sans slash initial
+- Pas de nouveaux fichiers (seulement des fichiers existants à modifier)
+- Pas de markdown, uniquement le JSON brut
+"""
+else:
+    # Pas de contexte global : stratégie 2 niveaux
+    scan_prompt = f"""Tu es un agent de développement senior.
+Tu vas implémenter une feature dans un projet. Avant de coder, identifie les fichiers dont tu as besoin.
+
+Issue #{issue_number} — {title}
+
+== SPEC ==
+{spec_content}
+
+== STRUCTURE DU REPO ==
+{repo_tree}
+
+Réponds UNIQUEMENT avec un objet JSON ayant deux clés :
+{{
+  "files_to_modify": ["chemin/relatif/fichier_a_modifier_1", ...],
+  "files_for_context": ["chemin/relatif/fichier_contexte_1", ...]
+}}
+
+- "files_to_modify" : fichiers existants que tu devras MODIFIER (contenu complet fourni)
+- "files_for_context" : autres fichiers que tu consultes pour comprendre les types, les routes déjà existantes, les hooks, etc. (squelette fourni : imports + signatures)
+- Chemins relatifs à la racine du repo, sans slash initial
+- Pas de nouveaux fichiers dans ces listes (seulement des fichiers existants)
 - Pas de markdown, uniquement le JSON brut
 """
 
-print("[feature-dev-agent] Passe 1 : identification des fichiers existants à lire...", file=sys.stderr)
+print("[feature-dev-agent] Passe 1 : identification des fichiers à lire...", file=sys.stderr)
 scan_raw = strip_code_fence(call_api(scan_prompt, AI_MODEL))
 
-files_to_read = []
+files_to_modify = []
+files_for_context = []
 try:
     scan_result = json.loads(scan_raw)
-    files_to_read = scan_result.get("files_to_read", [])
+    files_to_modify = scan_result.get("files_to_modify", [])
+    files_for_context = [] if codebase_context_section else scan_result.get("files_for_context", [])
+    # Fallback : ancien format files_to_read
+    if not files_to_modify and not files_for_context:
+        files_to_modify = scan_result.get("files_to_read", [])
+    print(f"[feature-dev-agent]   À modifier  : {files_to_modify}", file=sys.stderr)
+    if files_for_context:
+        print(f"[feature-dev-agent]   Contexte    : {files_for_context}", file=sys.stderr)
 except json.JSONDecodeError:
-    print(f"[feature-dev-agent] Passe 1 : JSON invalide, on continue sans lire de fichiers existants.", file=sys.stderr)
+    print("[feature-dev-agent] Passe 1 : JSON invalide, on continue sans lire de fichiers existants.", file=sys.stderr)
 
-# Lire les fichiers existants depuis le repo cloné (le runner a accès au codebase complet)
-existing_files_section = ""
-loaded = []
-for rel_path in files_to_read[:10]:
+
+def read_file_full(rel_path: str, budget: int) -> tuple[str, int]:
+    """Lit un fichier en entier, dans la limite du budget. Retourne (contenu, chars_utilisés)."""
     file_path = ROOT / rel_path.lstrip("/")
     if not file_path.exists() or not file_path.is_file():
-        print(f"[feature-dev-agent] Fichier non trouvé, ignoré : {rel_path}", file=sys.stderr)
-        continue
+        print(f"[feature-dev-agent]   ⚠ Fichier non trouvé, ignoré : {rel_path}", file=sys.stderr)
+        return "", 0
     content = file_path.read_text(encoding="utf-8", errors="replace")
-    # Limiter la taille pour ne pas exploser le contexte
     total_chars = len(content)
-    if total_chars > PASS1_MAX_CHARS:
-        content = content[:PASS1_MAX_CHARS] + f"\n... [TRONQUÉ à {PASS1_MAX_CHARS} chars — {total_chars - PASS1_MAX_CHARS} chars supplémentaires non affichés]"
-    loaded.append(rel_path)
-    existing_files_section += f"\n--- FICHIER EXISTANT : {rel_path} ---\n{content}\n"
+    if total_chars > budget:
+        content = content[:budget] + f"\n... [TRONQUÉ — {total_chars - budget} chars supplémentaires non affichés, budget épuisé]"
+        print(f"[feature-dev-agent]   ✓ {rel_path} ({total_chars} chars, tronqué à {budget})", file=sys.stderr)
+        return content, budget
+    print(f"[feature-dev-agent]   ✓ {rel_path} ({total_chars} chars)", file=sys.stderr)
+    return content, total_chars
+
+
+def read_file_skeleton(rel_path: str, max_lines: int) -> str:
+    """Lit les N premières lignes d'un fichier (imports, exports, signatures)."""
+    file_path = ROOT / rel_path.lstrip("/")
+    if not file_path.exists() or not file_path.is_file():
+        print(f"[feature-dev-agent]   ⚠ Fichier contexte non trouvé, ignoré : {rel_path}", file=sys.stderr)
+        return ""
+    lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    total_lines = len(lines)
+    skeleton = "\n".join(lines[:max_lines])
+    suffix = f"\n... [{total_lines - max_lines} lignes supplémentaires non affichées]" if total_lines > max_lines else ""
+    print(f"[feature-dev-agent]   ~ {rel_path} (squelette {min(max_lines, total_lines)}/{total_lines} lignes)", file=sys.stderr)
+    return skeleton + suffix
+
+
+# Lecture des fichiers à modifier (contenu complet)
+existing_files_section = ""
+loaded = []
+budget_remaining = BUDGET_MODIFY_CHARS
+
+for rel_path in files_to_modify:
+    if budget_remaining <= 0:
+        print(f"[feature-dev-agent]   ⚠ Budget épuisé, fichier ignoré : {rel_path}", file=sys.stderr)
+        continue
+    content, used = read_file_full(rel_path, budget_remaining)
+    if content:
+        loaded.append(rel_path)
+        existing_files_section += f"\n--- FICHIER À MODIFIER (contenu complet) : {rel_path} ---\n{content}\n"
+        budget_remaining -= used
+
+# Lecture des fichiers de contexte (squelette)
+context_section = ""
+for rel_path in files_for_context:
+    # Éviter les doublons avec files_to_modify
+    if rel_path in files_to_modify:
+        continue
+    skeleton = read_file_skeleton(rel_path, BUDGET_CONTEXT_LINES)
+    if skeleton:
+        context_section += f"\n--- FICHIER CONTEXTE (squelette {BUDGET_CONTEXT_LINES} lignes) : {rel_path} ---\n{skeleton}\n"
 
 if loaded:
-    print(f"[feature-dev-agent] Passe 1 : {len(loaded)} fichier(s) chargé(s) : {', '.join(loaded)}", file=sys.stderr)
+    print(f"[feature-dev-agent] Passe 1 : {len(loaded)} fichier(s) complet(s) + {len(files_for_context)} contexte(s)", file=sys.stderr)
     existing_files_inject = f"""
-== FICHIERS EXISTANTS À MODIFIER ==
-ATTENTION : Ces fichiers contiennent du code existant que tu DOIS conserver intégralement.
-Tu ne supprimes AUCUNE fonction, route, modèle ou import existant — tu AJOUTES seulement ce que la spec demande.
+== FICHIERS À MODIFIER (contenu complet — CONSERVER TOUT LE CODE EXISTANT) ==
+RÈGLE ABSOLUE : Pour chaque fichier ci-dessous, tu dois conserver INTÉGRALEMENT le code existant.
+Tu ne supprimes AUCUNE fonction, route, modèle Prisma, import ou export existant.
+Tu AJOUTES uniquement ce que la spec demande, sans toucher au reste.
 {existing_files_section}
+"""
+    if context_section:
+        existing_files_inject += f"""
+== FICHIERS DE CONTEXTE (squelette — pour comprendre les types, API, imports) ==
+Ces fichiers ne seront pas modifiés directement, ils te donnent le contexte global du codebase.
+{context_section}
 """
 else:
     existing_files_inject = ""
+    if context_section:
+        existing_files_inject = f"""
+== FICHIERS DE CONTEXTE (squelette — pour comprendre les types, API, imports) ==
+{context_section}
+"""
 
 # ─── Passe 2 : génération du code avec contexte complet ──────────────────────
 
@@ -245,7 +358,7 @@ Tu dois implémenter la feature décrite en générant les fichiers nécessaires
 
 Issue #{issue_number} — {title}
 
-{conventions_section}{existing_files_inject}== SPEC ==
+{conventions_section}{codebase_context_section}{existing_files_inject}== SPEC ==
 {spec_content}
 
 == STRUCTURE DU REPO ==
