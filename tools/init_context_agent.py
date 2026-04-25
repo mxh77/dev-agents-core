@@ -60,9 +60,9 @@ SKELETON_DIRS = [
     "frontend/web/src/pages",
     "frontend/web/src/components",
 ]
-SKELETON_LINES = 80   # premières lignes par fichier skeleton
-MAX_FULL_CHARS = 400000   # budget total pour les fichiers complets
-MAX_SKELETON_FILES = 150  # limite de fichiers skeleton pour ne pas exploser
+SKELETON_LINES = 150       # premières lignes par fichier skeleton (imports + exports + signatures + types)
+MAX_FULL_CHARS = 2_000_000  # budget total pour les fichiers complets — DeepSeek-V4-Flash : 1M tokens ≈ 4M chars
+MAX_SKELETON_FILES = 600    # pas de limite artificielle — on exploite la fenêtre 1M tokens
 
 
 def get_repo_tree(root: pathlib.Path) -> str:
@@ -75,7 +75,9 @@ def get_repo_tree(root: pathlib.Path) -> str:
     return "\n".join(lines)
 
 
-def call_api(prompt: str, model: str) -> str:
+def call_api(prompt: str, model: str, retries: int = 2) -> str:
+    import http.client
+    import time
     if model.startswith("claude-"):
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         if not api_key:
@@ -96,13 +98,21 @@ def call_api(prompt: str, model: str) -> str:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return "".join(
-            block.get("text", "")
-            for block in data.get("content", [])
-            if block.get("type") == "text"
-        )
+        for attempt in range(retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                return "".join(
+                    block.get("text", "")
+                    for block in data.get("content", [])
+                    if block.get("type") == "text"
+                )
+            except (http.client.IncompleteRead, TimeoutError) as e:
+                if attempt < retries:
+                    print(f"[init-context] Tentative {attempt + 1} échouée ({e}), retry...", file=sys.stderr)
+                    time.sleep(5)
+                else:
+                    raise
     elif "deepseek" in model:
         api_key = os.environ.get("DEEPSEEK_API_KEY", "")
         if not api_key:
@@ -111,6 +121,9 @@ def call_api(prompt: str, model: str) -> str:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
+            # Désactivation du mode thinking (actif par défaut sur deepseek-v4-flash)
+            # → économise les tokens de sortie sur une tâche de résumé/extraction
+            "thinking": {"type": "disabled"},
         }
         req = urllib.request.Request(
             "https://api.deepseek.com/v1/chat/completions",
@@ -121,9 +134,17 @@ def call_api(prompt: str, model: str) -> str:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"]
+        for attempt in range(retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                return data["choices"][0]["message"]["content"]
+            except (http.client.IncompleteRead, TimeoutError) as e:
+                if attempt < retries:
+                    print(f"[init-context] Tentative {attempt + 1} échouée ({e}), retry...", file=sys.stderr)
+                    time.sleep(5)
+                else:
+                    raise
     else:
         api_key = os.environ.get("OPENAI_API_KEY", "")
         if not api_key:
@@ -143,14 +164,22 @@ def call_api(prompt: str, model: str) -> str:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return "".join(
-            content.get("text", "")
-            for item in data.get("output", [])
-            for content in item.get("content", [])
-            if content.get("type") == "output_text"
-        )
+        for attempt in range(retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                return "".join(
+                    content.get("text", "")
+                    for item in data.get("output", [])
+                    for content in item.get("content", [])
+                    if content.get("type") == "output_text"
+                )
+            except (http.client.IncompleteRead, TimeoutError) as e:
+                if attempt < retries:
+                    print(f"[init-context] Tentative {attempt + 1} échouée ({e}), retry...", file=sys.stderr)
+                    time.sleep(5)
+                else:
+                    raise
 
 
 # ─── Collecte des fichiers ────────────────────────────────────────────────────
