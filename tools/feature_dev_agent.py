@@ -1,4 +1,26 @@
 #!/usr/bin/env python3
+"""
+feature_dev_agent.py — Agent de développement avec boucle outil (tool calling loop)
+
+Architecture :
+  1. Chargement : spec, conventions, codebase_context.md, repo_tree
+  2. Boucle outil : le LLM appelle read_file / list_directory autant que nécessaire
+  3. Génération : le LLM produit des PATCHES (old/new) pour les fichiers existants
+                  et des FILE complets pour les nouveaux fichiers
+  4. Application : patches appliqués chirurgicalement, nouveaux fichiers écrits
+
+Outils disponibles pour le LLM :
+  - read_file(path)          : lit un fichier existant en entier
+  - list_directory(path)     : liste les fichiers d'un dossier
+
+Format de sortie du LLM :
+  <<<FILE:path>>>            : nouveau fichier (contenu complet)
+  <<<PATCH:path>>>           : patch pour fichier existant
+  <<<OLD>>>                  : début du bloc à remplacer (exact)
+  <<<NEW>>>                  : début du nouveau bloc
+  <<<END>>>                  : fin de bloc
+  <<<SUMMARY>>>              : résumé Markdown
+"""
 import json
 import os
 import pathlib
@@ -14,6 +36,8 @@ AI_DIR = ROOT / ".ai"
 
 IGNORE_DIRS = {".git", ".ai", "node_modules", "__pycache__", "dist", "build", "dev-agents-core", ".venv", "venv"}
 
+MAX_TOOL_ROUNDS = 30   # limite de tours pour éviter les boucles infinies
+
 
 def slugify(text: str) -> str:
     text = text.lower().strip()
@@ -21,7 +45,7 @@ def slugify(text: str) -> str:
     return re.sub(r"-+", "-", text).strip("-")[:60]
 
 
-def get_repo_tree(root: pathlib.Path, max_files: int = 300) -> str:
+def get_repo_tree(root: pathlib.Path, max_files: int = 600) -> str:
     lines = []
     for p in sorted(root.rglob("*")):
         if any(part in IGNORE_DIRS or part.startswith(".") for part in p.relative_to(root).parts):
@@ -42,82 +66,267 @@ def strip_code_fence(text: str) -> str:
     return text
 
 
-def call_api(prompt: str, model: str) -> str:
+# ─── Définition des outils ───────────────────────────────────────────────────
+
+TOOLS_OPENAI = [
+    {
+        "type": "function",
+        "name": "read_file",
+        "description": "Lit le contenu complet d'un fichier du repo. Utilise cet outil pour lire tout fichier dont tu as besoin avant de générer du code.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Chemin relatif du fichier depuis la racine du repo (ex: backend/src/modules/horses/horses.service.ts)"
+                }
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "list_directory",
+        "description": "Liste les fichiers (non récursif) d'un dossier du repo.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Chemin relatif du dossier depuis la racine du repo (ex: backend/src/modules/horses)"
+                }
+            },
+            "required": ["path"]
+        }
+    }
+]
+
+# Format Anthropic (tool_use)
+TOOLS_ANTHROPIC = [
+    {
+        "name": "read_file",
+        "description": "Lit le contenu complet d'un fichier du repo. Utilise cet outil pour lire tout fichier dont tu as besoin avant de générer du code.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Chemin relatif du fichier depuis la racine du repo"
+                }
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "list_directory",
+        "description": "Liste les fichiers (non récursif) d'un dossier du repo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Chemin relatif du dossier depuis la racine du repo"
+                }
+            },
+            "required": ["path"]
+        }
+    }
+]
+
+
+def execute_tool(name: str, args: dict) -> str:
+    """Exécute un outil appelé par le LLM et retourne le résultat sous forme de string."""
+    if name == "read_file":
+        rel_path = args.get("path", "").lstrip("/")
+        file_path = ROOT / rel_path
+        if not file_path.exists() or not file_path.is_file():
+            return f"ERREUR : fichier '{rel_path}' introuvable dans le repo."
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+        print(f"[feature-dev-agent]   [tool] read_file({rel_path}) — {len(content)} chars", file=sys.stderr)
+        return content
+    elif name == "list_directory":
+        rel_path = args.get("path", "").lstrip("/")
+        dir_path = ROOT / rel_path
+        if not dir_path.exists() or not dir_path.is_dir():
+            return f"ERREUR : dossier '{rel_path}' introuvable dans le repo."
+        entries = sorted(dir_path.iterdir())
+        lines = []
+        for e in entries:
+            suffix = "/" if e.is_dir() else ""
+            lines.append(f"{e.name}{suffix}")
+        result = "\n".join(lines)
+        print(f"[feature-dev-agent]   [tool] list_directory({rel_path}) — {len(entries)} entrées", file=sys.stderr)
+        return result
+    else:
+        return f"ERREUR : outil inconnu '{name}'."
+
+
+# ─── call_api_agentic : boucle outil multi-tour ──────────────────────────────
+
+def call_api_agentic(system_prompt: str, user_prompt: str, model: str) -> str:
+    """
+    Appelle le LLM en mode agentique avec support des outils (read_file, list_directory).
+    Boucle jusqu'à ce que le LLM arrête d'appeler des outils (finish_reason=stop/end_turn).
+    Retourne le texte final du LLM.
+    """
+    import http.client
+    import time
+
+    rounds = 0
+
     if model.startswith("claude-"):
+        # ── Anthropic ────────────────────────────────────────────────────────
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         if not api_key:
-            print("[feature-dev-agent] ANTHROPIC_API_KEY manquant pour le modèle Claude.", file=sys.stderr)
+            print("[feature-dev-agent] ANTHROPIC_API_KEY manquant.", file=sys.stderr)
             sys.exit(1)
-        payload = {
-            "model": model,
-            "max_tokens": 16000,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return "".join(
-            block.get("text", "")
-            for block in data.get("content", [])
-            if block.get("type") == "text"
-        )
-    elif "deepseek" in model:
-        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-        if not api_key:
-            print("[feature-dev-agent] DEEPSEEK_API_KEY manquant pour le modèle DeepSeek.", file=sys.stderr)
-            sys.exit(1)
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        req = urllib.request.Request(
-            "https://api.deepseek.com/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"]
+
+        messages = [{"role": "user", "content": user_prompt}]
+
+        while rounds < MAX_TOOL_ROUNDS:
+            rounds += 1
+            payload = {
+                "model": model,
+                "max_tokens": 32000,
+                "system": system_prompt,
+                "tools": TOOLS_ANTHROPIC,
+                "messages": messages,
+            }
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                method="POST",
+            )
+            for attempt in range(3):
+                try:
+                    with urllib.request.urlopen(req, timeout=180) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                    break
+                except (http.client.IncompleteRead, TimeoutError) as e:
+                    if attempt < 2:
+                        print(f"[feature-dev-agent] Retry ({e})...", file=sys.stderr)
+                        time.sleep(5)
+                    else:
+                        raise
+
+            stop_reason = data.get("stop_reason", "end_turn")
+            content_blocks = data.get("content", [])
+
+            # Ajouter la réponse de l'assistant à l'historique
+            messages.append({"role": "assistant", "content": content_blocks})
+
+            if stop_reason != "tool_use":
+                # Plus d'appels d'outils → retourner le texte
+                return "".join(
+                    b.get("text", "")
+                    for b in content_blocks
+                    if b.get("type") == "text"
+                )
+
+            # Exécuter les outils demandés
+            tool_results = []
+            for block in content_blocks:
+                if block.get("type") == "tool_use":
+                    result = execute_tool(block["name"], block.get("input", {}))
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block["id"],
+                        "content": result,
+                    })
+
+            messages.append({"role": "user", "content": tool_results})
+            print(f"[feature-dev-agent] Tour {rounds} : {len(tool_results)} outil(s) exécuté(s)", file=sys.stderr)
+
+        print(f"[feature-dev-agent] ⚠ Limite de {MAX_TOOL_ROUNDS} tours atteinte.", file=sys.stderr)
+        return ""
+
     else:
-        api_key = os.environ.get("OPENAI_API_KEY", "")
+        # ── OpenAI / DeepSeek (format chat/completions) ──────────────────────
+        if "deepseek" in model:
+            api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+            base_url = "https://api.deepseek.com/v1/chat/completions"
+            extra_payload = {"thinking": {"type": "disabled"}}
+        else:
+            api_key = os.environ.get("OPENAI_API_KEY", "")
+            base_url = "https://api.openai.com/v1/chat/completions"
+            extra_payload = {}
+
         if not api_key:
-            print("[feature-dev-agent] OPENAI_API_KEY manquant pour le modèle OpenAI.", file=sys.stderr)
+            print(f"[feature-dev-agent] Clé API manquante pour {model}.", file=sys.stderr)
             sys.exit(1)
-        payload = {
-            "model": model,
-            "input": prompt,
-            "max_output_tokens": 32000,
-        }
-        req = urllib.request.Request(
-            "https://api.openai.com/v1/responses",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return "".join(
-            content.get("text", "")
-            for item in data.get("output", [])
-            for content in item.get("content", [])
-            if content.get("type") == "output_text"
-        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        while rounds < MAX_TOOL_ROUNDS:
+            rounds += 1
+            payload = {
+                "model": model,
+                "messages": messages,
+                "tools": TOOLS_OPENAI,
+                "tool_choice": "auto",
+                "max_tokens": 32000,
+                **extra_payload,
+            }
+            req = urllib.request.Request(
+                base_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+                method="POST",
+            )
+            for attempt in range(3):
+                try:
+                    with urllib.request.urlopen(req, timeout=180) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                    break
+                except (http.client.IncompleteRead, TimeoutError) as e:
+                    if attempt < 2:
+                        print(f"[feature-dev-agent] Retry ({e})...", file=sys.stderr)
+                        time.sleep(5)
+                    else:
+                        raise
+
+            choice = data["choices"][0]
+            message = choice["message"]
+            finish_reason = choice.get("finish_reason", "stop")
+
+            # Ajouter la réponse de l'assistant à l'historique
+            messages.append(message)
+
+            if finish_reason != "tool_calls":
+                return message.get("content") or ""
+
+            # Exécuter les outils demandés
+            tool_calls = message.get("tool_calls", [])
+            tool_results_messages = []
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                try:
+                    args = json.loads(fn.get("arguments", "{}"))
+                except json.JSONDecodeError:
+                    args = {}
+                result = execute_tool(fn.get("name", ""), args)
+                tool_results_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result,
+                })
+
+            messages.extend(tool_results_messages)
+            print(f"[feature-dev-agent] Tour {rounds} : {len(tool_calls)} outil(s) exécuté(s)", file=sys.stderr)
+
+        print(f"[feature-dev-agent] ⚠ Limite de {MAX_TOOL_ROUNDS} tours atteinte.", file=sys.stderr)
+        return ""
 
 
 with open(GITHUB_EVENT_PATH, "r", encoding="utf-8") as f:
@@ -183,7 +392,7 @@ context_doc_path = AI_DIR / "codebase_context.md"
 if context_doc_path.exists():
     codebase_context_content = context_doc_path.read_text(encoding="utf-8")
     codebase_context_section = f"""== CONTEXTE GLOBAL DU CODEBASE ==
-(Généré par init_context_agent — architecture, modules, types, routes, hooks, schéma DB)
+(Architecture, modules, routes, hooks, types, schéma DB — généré par init_context_agent)
 
 {codebase_context_content}
 
@@ -191,258 +400,150 @@ if context_doc_path.exists():
     print("[feature-dev-agent] Contexte global codebase chargé (.ai/codebase_context.md).", file=sys.stderr)
 else:
     codebase_context_section = ""
-    print("[feature-dev-agent] ⚠ Pas de .ai/codebase_context.md — contexte global absent (lancer init-context).", file=sys.stderr)
+    print("[feature-dev-agent] ⚠ Pas de .ai/codebase_context.md (lancer init-context).", file=sys.stderr)
 
-# ─── Passe 1 : identifier les fichiers à lire ────────────────────────────────
-# Si .ai/codebase_context.md existe → seulement files_to_modify (contenu complet).
-# Sinon → stratégie 2 niveaux : files_to_modify + files_for_context (squelettes).
-#
-# Budget :
-#   Fenêtre LLM ≈ 128k tokens ≈ 512k chars.
-#   Spec + conventions + contexte global + repo tree ≈ ~80k chars → il reste ~430k pour les fichiers.
-BUDGET_MODIFY_CHARS = 400000   # budget total pour les fichiers à modifier (contenu complet)
-BUDGET_CONTEXT_LINES = 100     # nb de lignes max par fichier de contexte (imports + signatures)
+# ─── Prompt système ───────────────────────────────────────────────────────────
 
-if codebase_context_section:
-    # Contexte global disponible : on ne demande que les fichiers à modifier
-    scan_prompt = f"""Tu es un agent de développement senior.
-Tu vas implémenter une feature dans un projet. Le contexte global du codebase te sera fourni séparément.
-Identifie uniquement les fichiers existants que tu devras MODIFIER pour implémenter la feature.
+system_prompt = f"""Tu es un agent de développement senior qui implémente des features dans un codebase existant.
 
-Issue #{issue_number} — {title}
+Tu as accès à deux outils :
+- `read_file(path)` : lit le contenu complet d'un fichier
+- `list_directory(path)` : liste les fichiers d'un dossier
 
-== SPEC ==
-{spec_content}
+WORKFLOW OBLIGATOIRE :
+1. Commence par lire les fichiers que tu vas modifier (utilise read_file)
+2. Si tu as un doute sur la structure d'un dossier, utilise list_directory
+3. Une fois que tu as lu tous les fichiers nécessaires, génère ta réponse
 
-== STRUCTURE DU REPO ==
-{repo_tree}
+{conventions_section}{codebase_context_section}
+FORMAT DE RÉPONSE FINAL :
 
-Réponds UNIQUEMENT avec un objet JSON :
-{{
-  "files_to_modify": ["chemin/relatif/fichier_a_modifier_1", ...]
-}}
-
-- "files_to_modify" : fichiers existants que tu MODIFIERAS directement (contenu complet fourni)
-- N'inclus PAS les fichiers de contexte — ils sont déjà inclus dans le contexte global du codebase
-- Chemins relatifs à la racine du repo, sans slash initial
-- Pas de nouveaux fichiers (seulement des fichiers existants à modifier)
-- Pas de markdown, uniquement le JSON brut
-"""
-else:
-    # Pas de contexte global : stratégie 2 niveaux
-    scan_prompt = f"""Tu es un agent de développement senior.
-Tu vas implémenter une feature dans un projet. Avant de coder, identifie les fichiers dont tu as besoin.
-
-Issue #{issue_number} — {title}
-
-== SPEC ==
-{spec_content}
-
-== STRUCTURE DU REPO ==
-{repo_tree}
-
-Réponds UNIQUEMENT avec un objet JSON ayant deux clés :
-{{
-  "files_to_modify": ["chemin/relatif/fichier_a_modifier_1", ...],
-  "files_for_context": ["chemin/relatif/fichier_contexte_1", ...]
-}}
-
-- "files_to_modify" : fichiers existants que tu devras MODIFIER (contenu complet fourni)
-- "files_for_context" : autres fichiers que tu consultes pour comprendre les types, les routes déjà existantes, les hooks, etc. (squelette fourni : imports + signatures)
-- Chemins relatifs à la racine du repo, sans slash initial
-- Pas de nouveaux fichiers dans ces listes (seulement des fichiers existants)
-- Pas de markdown, uniquement le JSON brut
-"""
-
-print("[feature-dev-agent] Passe 1 : identification des fichiers à lire...", file=sys.stderr)
-scan_raw = strip_code_fence(call_api(scan_prompt, AI_MODEL))
-
-files_to_modify = []
-files_for_context = []
-try:
-    scan_result = json.loads(scan_raw)
-    files_to_modify = scan_result.get("files_to_modify", [])
-    files_for_context = [] if codebase_context_section else scan_result.get("files_for_context", [])
-    # Fallback : ancien format files_to_read
-    if not files_to_modify and not files_for_context:
-        files_to_modify = scan_result.get("files_to_read", [])
-    print(f"[feature-dev-agent]   À modifier  : {files_to_modify}", file=sys.stderr)
-    if files_for_context:
-        print(f"[feature-dev-agent]   Contexte    : {files_for_context}", file=sys.stderr)
-except json.JSONDecodeError:
-    print("[feature-dev-agent] Passe 1 : JSON invalide, on continue sans lire de fichiers existants.", file=sys.stderr)
-
-
-def read_file_full(rel_path: str, budget: int) -> tuple[str, int]:
-    """Lit un fichier en entier, dans la limite du budget. Retourne (contenu, chars_utilisés)."""
-    file_path = ROOT / rel_path.lstrip("/")
-    if not file_path.exists() or not file_path.is_file():
-        print(f"[feature-dev-agent]   ⚠ Fichier non trouvé, ignoré : {rel_path}", file=sys.stderr)
-        return "", 0
-    content = file_path.read_text(encoding="utf-8", errors="replace")
-    total_chars = len(content)
-    if total_chars > budget:
-        content = content[:budget] + f"\n... [TRONQUÉ — {total_chars - budget} chars supplémentaires non affichés, budget épuisé]"
-        print(f"[feature-dev-agent]   ✓ {rel_path} ({total_chars} chars, tronqué à {budget})", file=sys.stderr)
-        return content, budget
-    print(f"[feature-dev-agent]   ✓ {rel_path} ({total_chars} chars)", file=sys.stderr)
-    return content, total_chars
-
-
-def read_file_skeleton(rel_path: str, max_lines: int) -> str:
-    """Lit les N premières lignes d'un fichier (imports, exports, signatures)."""
-    file_path = ROOT / rel_path.lstrip("/")
-    if not file_path.exists() or not file_path.is_file():
-        print(f"[feature-dev-agent]   ⚠ Fichier contexte non trouvé, ignoré : {rel_path}", file=sys.stderr)
-        return ""
-    lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    total_lines = len(lines)
-    skeleton = "\n".join(lines[:max_lines])
-    suffix = f"\n... [{total_lines - max_lines} lignes supplémentaires non affichées]" if total_lines > max_lines else ""
-    print(f"[feature-dev-agent]   ~ {rel_path} (squelette {min(max_lines, total_lines)}/{total_lines} lignes)", file=sys.stderr)
-    return skeleton + suffix
-
-
-# Lecture des fichiers à modifier (contenu complet)
-existing_files_section = ""
-loaded = []
-budget_remaining = BUDGET_MODIFY_CHARS
-
-for rel_path in files_to_modify:
-    if budget_remaining <= 0:
-        print(f"[feature-dev-agent]   ⚠ Budget épuisé, fichier ignoré : {rel_path}", file=sys.stderr)
-        continue
-    content, used = read_file_full(rel_path, budget_remaining)
-    if content:
-        loaded.append(rel_path)
-        existing_files_section += f"\n--- FICHIER À MODIFIER (contenu complet) : {rel_path} ---\n{content}\n"
-        budget_remaining -= used
-
-# Lecture des fichiers de contexte (squelette)
-context_section = ""
-for rel_path in files_for_context:
-    # Éviter les doublons avec files_to_modify
-    if rel_path in files_to_modify:
-        continue
-    skeleton = read_file_skeleton(rel_path, BUDGET_CONTEXT_LINES)
-    if skeleton:
-        context_section += f"\n--- FICHIER CONTEXTE (squelette {BUDGET_CONTEXT_LINES} lignes) : {rel_path} ---\n{skeleton}\n"
-
-if loaded:
-    print(f"[feature-dev-agent] Passe 1 : {len(loaded)} fichier(s) complet(s) + {len(files_for_context)} contexte(s)", file=sys.stderr)
-    existing_files_inject = f"""
-== FICHIERS À MODIFIER (contenu complet — CONSERVER TOUT LE CODE EXISTANT) ==
-RÈGLE ABSOLUE : Pour chaque fichier ci-dessous, tu dois conserver INTÉGRALEMENT le code existant.
-Tu ne supprimes AUCUNE fonction, route, modèle Prisma, import ou export existant.
-Tu AJOUTES uniquement ce que la spec demande, sans toucher au reste.
-{existing_files_section}
-"""
-    if context_section:
-        existing_files_inject += f"""
-== FICHIERS DE CONTEXTE (squelette — pour comprendre les types, API, imports) ==
-Ces fichiers ne seront pas modifiés directement, ils te donnent le contexte global du codebase.
-{context_section}
-"""
-else:
-    existing_files_inject = ""
-    if context_section:
-        existing_files_inject = f"""
-== FICHIERS DE CONTEXTE (squelette — pour comprendre les types, API, imports) ==
-{context_section}
-"""
-
-# ─── Passe 2 : génération du code avec contexte complet ──────────────────────
-
-prompt = f"""Tu es un agent de développement senior. Tu reçois une spec technique, la structure du repo et le contenu intégral des fichiers que tu dois modifier.
-Tu dois implémenter la feature décrite en générant les fichiers nécessaires.
-
-Issue #{issue_number} — {title}
-
-{conventions_section}{codebase_context_section}{existing_files_inject}== SPEC ==
-{spec_content}
-
-== STRUCTURE DU REPO ==
-{repo_tree}
-
-== FORMAT DE RÉPONSE OBLIGATOIRE ==
-Réponds avec ce format exact (délimiteurs fixes, PAS de JSON) :
-
-<<<FILE:chemin/relatif/fichier1>>>
-contenu complet du fichier 1
+Pour les fichiers EXISTANTS modifiés → utilise des PATCHES (chirurgicaux, jamais le fichier complet) :
+<<<PATCH:chemin/relatif/fichier>>>
+<<<OLD>>>
+bloc de code EXACT à remplacer (copié mot pour mot depuis le fichier lu)
+inclure 3-5 lignes de contexte avant et après la modification
+<<<NEW>>>
+nouveau bloc de code (remplace exactement le bloc OLD)
 <<<END>>>
-<<<FILE:chemin/relatif/fichier2>>>
-contenu complet du fichier 2
+
+Pour les NOUVEAUX fichiers (n'existant pas encore) → contenu complet :
+<<<FILE:chemin/relatif/nouveau_fichier>>>
+contenu complet du nouveau fichier
 <<<END>>>
+
+Résumé :
 <<<SUMMARY>>>
-Résumé Markdown de ce qui a été implémenté
+Résumé Markdown de l'implémentation
 <<<END>>>
 
-Règles strictes :
-- Génère uniquement les fichiers nécessaires à l'implémentation (nouveaux ou modifiés)
-- Les chemins sont relatifs à la racine du repo
-- Le contenu de chaque fichier est complet (pas de placeholders, pas de "...", pas de commentaires "reste du code")
-- Pour les fichiers existants fournis ci-dessus : conserve TOUT le code existant, ajoute uniquement ce que la spec demande
-- Respecte IMPÉRATIVEMENT les conventions listées ci-dessus
-- Aucun texte avant le premier <<<FILE: ou après le dernier <<<END>>>
+RÈGLES CRITIQUES :
+- Pour un fichier existant : TOUJOURS utiliser <<<PATCH>>> (jamais <<<FILE>>>)
+  Le bloc <<<OLD>>> doit être une copie EXACTE du fichier (espaces, virgules, tout)
+- Pour un nouveau fichier : utiliser <<<FILE>>>
+- Plusieurs patches possibles pour un même fichier
+- Aucun texte hors des délimiteurs dans ta réponse finale
 """
 
-print(f"[feature-dev-agent] Passe 2 : génération du code (prompt ~{len(prompt)} chars)...", file=sys.stderr)
-raw = call_api(prompt, AI_MODEL).strip()
+user_prompt = f"""Implémente la feature suivante.
+
+Issue #{issue_number} — {title}
+
+== SPEC ==
+{spec_content}
+
+== STRUCTURE DU REPO ==
+{repo_tree}
+
+Commence par lire les fichiers que tu vas modifier avec read_file(), puis génère les patches/fichiers.
+"""
+
+# ─── Appel agentique (boucle outil) ──────────────────────────────────────────
+
+print(f"[feature-dev-agent] Démarrage boucle outil ({AI_MODEL}, max {MAX_TOOL_ROUNDS} tours)...", file=sys.stderr)
+raw = call_api_agentic(system_prompt, user_prompt, AI_MODEL).strip()
 
 if not raw:
-    print("[feature-dev-agent] Aucune sortie texte renvoyée par l'API.", file=sys.stderr)
+    print("[feature-dev-agent] Aucune sortie renvoyée par l'API.", file=sys.stderr)
     sys.exit(1)
 
-# ─── Parsing du format délimiteur ────────────────────────────────────────────
+# ─── Parsing patches + nouveaux fichiers ─────────────────────────────────────
 
-files = []
+patches = []   # [(path, old_str, new_str), ...]
+new_files = [] # [(path, content), ...]
 summary = "Implémentation générée par feature-dev-agent."
 
+patch_pattern = re.compile(
+    r'<<<PATCH:([^>]+)>>>\s*<<<OLD>>>\n(.*?)<<<NEW>>>\n(.*?)<<<END>>>',
+    re.DOTALL
+)
 file_pattern = re.compile(r'<<<FILE:([^>]+)>>>\n(.*?)<<<END>>>', re.DOTALL)
 summary_pattern = re.compile(r'<<<SUMMARY>>>\n(.*?)<<<END>>>', re.DOTALL)
+
+for m in patch_pattern.finditer(raw):
+    path = m.group(1).strip()
+    old_str = m.group(2)
+    new_str = m.group(3)
+    # Supprimer le newline final avant le délimiteur
+    if old_str.endswith("\n"):
+        old_str = old_str[:-1]
+    if new_str.endswith("\n"):
+        new_str = new_str[:-1]
+    patches.append((path, old_str, new_str))
 
 for m in file_pattern.finditer(raw):
     path = m.group(1).strip()
     content = m.group(2)
-    # Supprimer un éventuel newline final ajouté par le modèle avant le délimiteur
     if content.endswith("\n"):
         content = content[:-1]
-    files.append({"path": path, "content": content})
+    new_files.append((path, content))
 
 m_summary = summary_pattern.search(raw)
 if m_summary:
     summary = m_summary.group(1).strip()
 
-if not files:
-    # Fallback : tenter un parsing JSON si le modèle a ignoré les consignes de format
-    print("[feature-dev-agent] Format délimiteur non trouvé, tentative fallback JSON...", file=sys.stderr)
-    raw_json = strip_code_fence(raw)
-    try:
-        result = json.loads(raw_json)
-        files = result.get("files", [])
-        summary = result.get("summary", summary)
-    except json.JSONDecodeError as e:
-        print(f"[feature-dev-agent] Échec parsing JSON fallback : {e}", file=sys.stderr)
-        print(raw[:800], file=sys.stderr)
-        sys.exit(1)
-
-if not files:
-    print("[feature-dev-agent] Aucun fichier généré.", file=sys.stderr)
+if not patches and not new_files:
+    print("[feature-dev-agent] ⚠ Aucun patch ni fichier généré.", file=sys.stderr)
+    print(raw[:800], file=sys.stderr)
     sys.exit(1)
 
-generated_paths = []
-for file_def in files:
-    rel_path = file_def.get("path", "").lstrip("/")
-    file_content = file_def.get("content", "")
-    if not rel_path:
-        continue
-    target = ROOT / rel_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(file_content, encoding="utf-8")
-    generated_paths.append(rel_path)
-    print(f"  [+] {rel_path}")
+# ─── Application des patches ─────────────────────────────────────────────────
 
-print(f"\n[feature-dev-agent] {len(generated_paths)} fichier(s) généré(s).")
+generated_paths = []
+
+for path, old_str, new_str in patches:
+    rel_path = path.lstrip("/")
+    file_path = ROOT / rel_path
+    if not file_path.exists():
+        print(f"  [!] PATCH ignoré — fichier introuvable : {rel_path}", file=sys.stderr)
+        continue
+    content = file_path.read_text(encoding="utf-8")
+    if old_str not in content:
+        print(f"  [!] PATCH échoué — bloc OLD introuvable dans {rel_path}", file=sys.stderr)
+        print(f"      OLD attendu : {repr(old_str[:120])}", file=sys.stderr)
+        continue
+    occurrences = content.count(old_str)
+    if occurrences > 1:
+        print(f"  [!] PATCH ambigu — {occurrences} occurrences du bloc OLD dans {rel_path}, patch ignoré", file=sys.stderr)
+        continue
+    content = content.replace(old_str, new_str, 1)
+    file_path.write_text(content, encoding="utf-8")
+    if rel_path not in generated_paths:
+        generated_paths.append(rel_path)
+    print(f"  [~] {rel_path} (patch appliqué)")
+
+# ─── Écriture des nouveaux fichiers ──────────────────────────────────────────
+
+for path, content in new_files:
+    rel_path = path.lstrip("/")
+    file_path = ROOT / rel_path
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(content, encoding="utf-8")
+    if rel_path not in generated_paths:
+        generated_paths.append(rel_path)
+    print(f"  [+] {rel_path} (nouveau fichier)")
+
+print(f"\n[feature-dev-agent] {len(patches)} patch(es) + {len(new_files)} nouveau(x) fichier(s).")
 
 # Write PR body
 files_list = "\n".join(f"- `{p}`" for p in generated_paths)
