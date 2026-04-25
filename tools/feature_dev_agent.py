@@ -251,9 +251,18 @@ Issue #{issue_number} — {title}
 == STRUCTURE DU REPO ==
 {repo_tree}
 
-Ta réponse doit être un objet JSON valide avec exactement deux clés :
-- "files": liste d'objets {{"path": "chemin/relatif/au/repo", "content": "contenu complet du fichier"}}
-- "summary": string Markdown décrivant ce qui a été implémenté
+== FORMAT DE RÉPONSE OBLIGATOIRE ==
+Réponds avec ce format exact (délimiteurs fixes, PAS de JSON) :
+
+<<<FILE:chemin/relatif/fichier1>>>
+contenu complet du fichier 1
+<<<END>>>
+<<<FILE:chemin/relatif/fichier2>>>
+contenu complet du fichier 2
+<<<END>>>
+<<<SUMMARY>>>
+Résumé Markdown de ce qui a été implémenté
+<<<END>>>
 
 Règles strictes :
 - Génère uniquement les fichiers nécessaires à l'implémentation (nouveaux ou modifiés)
@@ -261,25 +270,48 @@ Règles strictes :
 - Le contenu de chaque fichier est complet (pas de placeholders, pas de "...", pas de commentaires "reste du code")
 - Pour les fichiers existants fournis ci-dessus : conserve TOUT le code existant, ajoute uniquement ce que la spec demande
 - Respecte IMPÉRATIVEMENT les conventions listées ci-dessus
-- Pas de markdown autour du JSON, uniquement le JSON brut
+- Aucun texte avant le premier <<<FILE: ou après le dernier <<<END>>>
 """
 
 print(f"[feature-dev-agent] Passe 2 : génération du code (prompt ~{len(prompt)} chars)...", file=sys.stderr)
-raw = strip_code_fence(call_api(prompt, AI_MODEL))
+raw = call_api(prompt, AI_MODEL).strip()
 
-if not raw.strip():
+if not raw:
     print("[feature-dev-agent] Aucune sortie texte renvoyée par l'API.", file=sys.stderr)
     sys.exit(1)
 
-try:
-    result = json.loads(raw)
-except json.JSONDecodeError as e:
-    print(f"[feature-dev-agent] Réponse JSON invalide : {e}", file=sys.stderr)
-    print(raw[:500], file=sys.stderr)
-    sys.exit(1)
+# ─── Parsing du format délimiteur ────────────────────────────────────────────
 
-files = result.get("files", [])
-summary = result.get("summary", "Implémentation générée par feature-dev-agent.")
+files = []
+summary = "Implémentation générée par feature-dev-agent."
+
+file_pattern = re.compile(r'<<<FILE:([^>]+)>>>\n(.*?)<<<END>>>', re.DOTALL)
+summary_pattern = re.compile(r'<<<SUMMARY>>>\n(.*?)<<<END>>>', re.DOTALL)
+
+for m in file_pattern.finditer(raw):
+    path = m.group(1).strip()
+    content = m.group(2)
+    # Supprimer un éventuel newline final ajouté par le modèle avant le délimiteur
+    if content.endswith("\n"):
+        content = content[:-1]
+    files.append({"path": path, "content": content})
+
+m_summary = summary_pattern.search(raw)
+if m_summary:
+    summary = m_summary.group(1).strip()
+
+if not files:
+    # Fallback : tenter un parsing JSON si le modèle a ignoré les consignes de format
+    print("[feature-dev-agent] Format délimiteur non trouvé, tentative fallback JSON...", file=sys.stderr)
+    raw_json = strip_code_fence(raw)
+    try:
+        result = json.loads(raw_json)
+        files = result.get("files", [])
+        summary = result.get("summary", summary)
+    except json.JSONDecodeError as e:
+        print(f"[feature-dev-agent] Échec parsing JSON fallback : {e}", file=sys.stderr)
+        print(raw[:800], file=sys.stderr)
+        sys.exit(1)
 
 if not files:
     print("[feature-dev-agent] Aucun fichier généré.", file=sys.stderr)
