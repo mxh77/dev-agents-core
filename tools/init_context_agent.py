@@ -121,6 +121,7 @@ def call_api(prompt: str, model: str, retries: int = 2) -> str:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 32000,
             # Désactivation du mode thinking (actif par défaut sur deepseek-v4-flash)
             # → économise les tokens de sortie sur une tâche de résumé/extraction
             "thinking": {"type": "disabled"},
@@ -270,36 +271,38 @@ Ce document sera injecté dans chaque session d'un agent de développement autom
 {skeleton_files}
 
 == DOCUMENT À PRODUIRE ==
-Génère un document Markdown structuré avec les sections suivantes :
+Génère un document Markdown EXHAUSTIF et COMPLET. L'agent qui lira ce fichier n'aura PAS accès aux fichiers sources : ce document est sa SEULE référence.
+Si tu n'as pas la place de tout couvrir, sois dense et concis, mais ne saute AUCUN fichier, AUCUNE route, AUCUN hook.
 
 ## 1. Architecture globale
-Décris l'organisation du monorepo (packages, responsabilités).
+Organisation du monorepo (packages, responsabilités, flux de données).
 
 ## 2. Schéma de base de données
-Liste toutes les tables Prisma avec leurs champs principaux et relations.
+Liste TOUTES les tables Prisma : champs importants, types, relations, contraintes uniques.
 
-## 3. Modules backend
-Pour chaque module (finances, horses, stables, users, auth...) :
-- Nom du module
-- Routes exposées (méthode + path + rôle requis)
-- Fonctions principales du service
+## 3. Modules backend (EXHAUSTIF)
+Pour CHAQUE module, liste TOUTES les routes :
+`[MÉTHODE] [path] → [fonction] (rôle requis)`
+Puis les fonctions principales du service avec leur signature simplifiée.
 
-## 4. API frontend
-Pour chaque fichier `src/api/*.ts` : fonctions exportées + endpoint appelé.
+## 4. API frontend (EXHAUSTIF)
+Pour CHAQUE fichier `src/api/*.ts`, liste TOUTES les fonctions exportées :
+`nomFonction(params) → endpoint [MÉTHODE url]`
 
-## 5. Hooks React Query
-Pour chaque hook (`useQuery` / `useMutation`) : nom, mutation ou query, invalidations.
+## 5. Hooks React Query (EXHAUSTIF)
+Pour CHAQUE hook de `src/hooks/*.ts` :
+`useXxx(params) → useQuery/useMutation — queryKey: [...] — invalide: [...]`
 
 ## 6. Types et schémas partagés
-Types TypeScript et schémas Zod clés exportés depuis `@cavalcade/shared`.
+Tous les types TS et schémas Zod exportés depuis `@cavalcade/shared`, avec leurs champs principaux.
 
 ## 7. Conventions de nommage et patterns
-Patterns récurrents à respecter (nommage fichiers, structure composants, gestion erreurs...).
+Règles de nommage (fichiers, tables, fonctions), patterns de code récurrents.
 
-## 8. Points d'attention
-Conventions critiques, pièges connus, règles à ne jamais violer.
+## 8. Points d'attention CRITIQUES
+Règles absolues à ne jamais violer, pièges courants, comportements non-évidents.
 
-Sois précis, exhaustif et factuel. Pas de code inventé — uniquement ce qui existe dans les fichiers fournis.
+EXIGENCES : exhaustif, factuel, dense. Aucun fichier ignoré. Aucune phrase inachevée.
 """
 
 print(f"[init-context] Appel API ({AI_MODEL}, prompt ~{len(prompt)} chars)...", file=sys.stderr)
