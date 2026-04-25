@@ -71,32 +71,36 @@ def strip_code_fence(text: str) -> str:
 TOOLS_OPENAI = [
     {
         "type": "function",
-        "name": "read_file",
-        "description": "Lit le contenu complet d'un fichier du repo. Utilise cet outil pour lire tout fichier dont tu as besoin avant de générer du code.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Chemin relatif du fichier depuis la racine du repo (ex: backend/src/modules/horses/horses.service.ts)"
-                }
-            },
-            "required": ["path"]
+        "function": {
+            "name": "read_file",
+            "description": "Lit le contenu complet d'un fichier du repo. Utilise cet outil pour lire tout fichier dont tu as besoin avant de générer du code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Chemin relatif du fichier depuis la racine du repo (ex: backend/src/modules/horses/horses.service.ts)"
+                    }
+                },
+                "required": ["path"]
+            }
         }
     },
     {
         "type": "function",
-        "name": "list_directory",
-        "description": "Liste les fichiers (non récursif) d'un dossier du repo.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Chemin relatif du dossier depuis la racine du repo (ex: backend/src/modules/horses)"
-                }
-            },
-            "required": ["path"]
+        "function": {
+            "name": "list_directory",
+            "description": "Liste les fichiers (non récursif) d'un dossier du repo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Chemin relatif du dossier depuis la racine du repo (ex: backend/src/modules/horses)"
+                    }
+                },
+                "required": ["path"]
+            }
         }
     }
 ]
@@ -250,7 +254,7 @@ def call_api_agentic(system_prompt: str, user_prompt: str, model: str) -> str:
         if "deepseek" in model:
             api_key = os.environ.get("DEEPSEEK_API_KEY", "")
             base_url = "https://api.deepseek.com/v1/chat/completions"
-            extra_payload = {"thinking": {"type": "disabled"}}
+            extra_payload = {}  # thinking incompatible avec tool calling
         else:
             api_key = os.environ.get("OPENAI_API_KEY", "")
             base_url = "https://api.openai.com/v1/chat/completions"
@@ -318,7 +322,7 @@ def call_api_agentic(system_prompt: str, user_prompt: str, model: str) -> str:
                 result = execute_tool(fn.get("name", ""), args)
                 tool_results_messages.append({
                     "role": "tool",
-                    "tool_call_id": tc["id"],
+                    "tool_call_id": tc.get("id", ""),
                     "content": result,
                 })
 
