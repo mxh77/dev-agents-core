@@ -206,13 +206,20 @@ def call_api_agentic(system_prompt: str, user_prompt: str, model: str) -> str:
                 },
                 method="POST",
             )
-            for attempt in range(3):
+            for attempt in range(5):
                 try:
                     with urllib.request.urlopen(req, timeout=180) as resp:
                         data = json.loads(resp.read().decode("utf-8"))
                     break
+                except urllib.error.HTTPError as e:
+                    if e.code == 429 and attempt < 4:
+                        wait = int(e.headers.get("retry-after", 60))
+                        print(f"[feature-dev-agent] Rate limit 429 — attente {wait}s (tentative {attempt+1}/5)...", file=sys.stderr)
+                        time.sleep(wait)
+                    else:
+                        raise
                 except (http.client.IncompleteRead, TimeoutError) as e:
-                    if attempt < 2:
+                    if attempt < 4:
                         print(f"[feature-dev-agent] Retry ({e})...", file=sys.stderr)
                         time.sleep(5)
                     else:
@@ -288,13 +295,20 @@ def call_api_agentic(system_prompt: str, user_prompt: str, model: str) -> str:
                 },
                 method="POST",
             )
-            for attempt in range(3):
+            for attempt in range(5):
                 try:
                     with urllib.request.urlopen(req, timeout=180) as resp:
                         data = json.loads(resp.read().decode("utf-8"))
                     break
+                except urllib.error.HTTPError as e:
+                    if e.code == 429 and attempt < 4:
+                        wait = int(e.headers.get("retry-after", 60))
+                        print(f"[feature-dev-agent] Rate limit 429 — attente {wait}s (tentative {attempt+1}/5)...", file=sys.stderr)
+                        time.sleep(wait)
+                    else:
+                        raise
                 except (http.client.IncompleteRead, TimeoutError) as e:
-                    if attempt < 2:
+                    if attempt < 4:
                         print(f"[feature-dev-agent] Retry ({e})...", file=sys.stderr)
                         time.sleep(5)
                     else:
