@@ -29,7 +29,7 @@ on:
         required: false
       DEEPSEEK_API_KEY:
         required: false
-      PAT_TOKEN:
+      DEV_AGENTS_CORE_TOKEN:
         required: false
 
 permissions:
@@ -132,7 +132,7 @@ jobs:
       - name: Open PR
         if: steps.check_pr.outputs.existing_pr == ''
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.DEV_AGENTS_CORE_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           BRANCH_NAME="$(cat .ai/branch_name.txt)"
           ISSUE_NUMBER="${{ inputs.issue_number || github.event.issue.number }}"
