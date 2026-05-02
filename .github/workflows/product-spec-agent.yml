@@ -18,12 +18,18 @@ on:
         required: false
         type: string
         default: gpt-4.1
+      issue_number:
+        required: false
+        type: string
+        default: ""
     secrets:
       OPENAI_API_KEY:
         required: false
       ANTHROPIC_API_KEY:
         required: false
       DEEPSEEK_API_KEY:
+        required: false
+      PAT_TOKEN:
         required: false
 
 permissions:
@@ -33,6 +39,10 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: product-spec-agent-${{ github.event.issue.number || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   product-spec-agent:
@@ -93,7 +103,7 @@ jobs:
 
       - name: Commit files
         run: |
-          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          ISSUE_NUMBER="${{ inputs.issue_number || github.event.issue.number }}"
           if [ -z "$ISSUE_NUMBER" ]; then
             ISSUE_NUMBER="manual"
           fi
@@ -122,10 +132,10 @@ jobs:
       - name: Open PR
         if: steps.check_pr.outputs.existing_pr == ''
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           BRANCH_NAME="$(cat .ai/branch_name.txt)"
-          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          ISSUE_NUMBER="${{ inputs.issue_number || github.event.issue.number }}"
           if [ -z "$ISSUE_NUMBER" ]; then
             ISSUE_NUMBER="manual"
           fi
