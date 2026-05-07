@@ -182,6 +182,6 @@ Validation humaine du cadrage avant passage à un agent de dev auto.
 """
 (ROOT / ".ai" / "pr_body.md").write_text(pr_body, encoding="utf-8")
 
-branch_name = f"product-spec-agent/issue-{issue_number}-{slugify(title)[:30]}"
+branch_name = f"branch_issue_{issue_number}"
 (ROOT / ".ai" / "branch_name.txt").write_text(branch_name, encoding="utf-8")
 print(branch_name)

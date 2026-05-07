@@ -648,6 +648,6 @@ Revue humaine du code avant merge.
 """
 (AI_DIR / "pr_body.md").write_text(pr_body, encoding="utf-8")
 
-branch_name = f"feature-dev/issue-{issue_number}-{slugify(title)[:30]}"
+branch_name = f"branch_issue_{issue_number}"
 (AI_DIR / "branch_name.txt").write_text(branch_name, encoding="utf-8")
 print(branch_name)
