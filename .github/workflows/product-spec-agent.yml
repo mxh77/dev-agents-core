@@ -108,7 +108,7 @@ jobs:
       - name: Commit files
         run: |
           BRANCH_NAME="$(cat .ai/branch_name.txt)"
-          ISSUE_NUMBER=$(echo "$BRANCH_NAME" | grep -oP '(?<=issue-)\d+' || true)
+          ISSUE_NUMBER=$(echo "$BRANCH_NAME" | grep -oP '(?<=branch_issue_)\d+' || true)
           if [ -z "$ISSUE_NUMBER" ]; then
             ISSUE_NUMBER="${{ inputs.issue_number || github.event.issue.number }}"
           fi
